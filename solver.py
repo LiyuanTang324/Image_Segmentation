@@ -1,300 +1,276 @@
 import os
-import numpy as np
 import time
-import datetime
-import torch
-import torchvision
-from torch import optim
-from torch.autograd import Variable
-import torch.nn.functional as F
-from evaluation import *
-from network import U_Net,R2U_Net,AttU_Net,R2AttU_Net
 import csv
+import numpy as np
+import torch
+import torch.nn as nn
+from torch import optim
+from network import U_Net, R2U_Net, AttU_Net, R2AttU_Net
+from evaluation import get_DSC, get_IoU, get_HD95
 
 
-class Solver(object):
-	def __init__(self, config, train_loader, valid_loader, test_loader):
+class DiceLoss(nn.Module):
+    """Soft Dice loss operating on logits (applies sigmoid internally)."""
 
-		# Data loader
-		self.train_loader = train_loader
-		self.valid_loader = valid_loader
-		self.test_loader = test_loader
-
-		# Models
-		self.unet = None
-		self.optimizer = None
-		self.img_ch = config.img_ch
-		self.output_ch = config.output_ch
-		self.criterion = torch.nn.BCELoss()
-		self.augmentation_prob = config.augmentation_prob
-
-		# Hyper-parameters
-		self.lr = config.lr
-		self.beta1 = config.beta1
-		self.beta2 = config.beta2
-
-		# Training settings
-		self.num_epochs = config.num_epochs
-		self.num_epochs_decay = config.num_epochs_decay
-		self.batch_size = config.batch_size
-
-		# Step size
-		self.log_step = config.log_step
-		self.val_step = config.val_step
-
-		# Path
-		self.model_path = config.model_path
-		self.result_path = config.result_path
-		self.mode = config.mode
-
-		self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-		self.model_type = config.model_type
-		self.t = config.t
-		self.build_model()
-
-	def build_model(self):
-		"""Build generator and discriminator."""
-		if self.model_type =='U_Net':
-			self.unet = U_Net(img_ch=3,output_ch=1)
-		elif self.model_type =='R2U_Net':
-			self.unet = R2U_Net(img_ch=3,output_ch=1,t=self.t)
-		elif self.model_type =='AttU_Net':
-			self.unet = AttU_Net(img_ch=3,output_ch=1)
-		elif self.model_type == 'R2AttU_Net':
-			self.unet = R2AttU_Net(img_ch=3,output_ch=1,t=self.t)
-			
-
-		self.optimizer = optim.Adam(list(self.unet.parameters()),
-									  self.lr, [self.beta1, self.beta2])
-		self.unet.to(self.device)
-
-		# self.print_network(self.unet, self.model_type)
-
-	def print_network(self, model, name):
-		"""Print out the network information."""
-		num_params = 0
-		for p in model.parameters():
-			num_params += p.numel()
-		print(model)
-		print(name)
-		print("The number of parameters: {}".format(num_params))
-
-	def to_data(self, x):
-		"""Convert variable to tensor."""
-		if torch.cuda.is_available():
-			x = x.cpu()
-		return x.data
-
-	def update_lr(self, g_lr, d_lr):
-		for param_group in self.optimizer.param_groups:
-			param_group['lr'] = lr
-
-	def reset_grad(self):
-		"""Zero the gradient buffers."""
-		self.unet.zero_grad()
-
-	def compute_accuracy(self,SR,GT):
-		SR_flat = SR.view(-1)
-		GT_flat = GT.view(-1)
-
-		acc = GT_flat.data.cpu()==(SR_flat.data.cpu()>0.5)
-
-	def tensor2img(self,x):
-		img = (x[:,0,:,:]>x[:,1,:,:]).float()
-		img = img*255
-		return img
+    def forward(self, logits, targets):
+        probs = torch.sigmoid(logits)
+        smooth = 1.0
+        pflat = probs.view(probs.size(0), -1)
+        tflat = targets.view(targets.size(0), -1)
+        inter = (pflat * tflat).sum(dim=1)
+        dice = (2.0 * inter + smooth) / (pflat.sum(dim=1) + tflat.sum(dim=1) + smooth)
+        return (1.0 - dice).mean()
 
 
-	def train(self):
-		"""Train encoder, generator and discriminator."""
+class Solver:
+    def __init__(self, config, train_loader, val_loader, test_loader):
+        self.config = config
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.test_loader = test_loader
 
-		#====================================== Training ===========================================#
-		#===========================================================================================#
-		
-		unet_path = os.path.join(self.model_path, '%s-%d-%.4f-%d-%.4f.pkl' %(self.model_type,self.num_epochs,self.lr,self.num_epochs_decay,self.augmentation_prob))
+        self.model_type = config.model_type
+        self.img_ch = config.img_ch
+        self.output_ch = config.output_ch
+        self.image_size = config.image_size
+        self.t = config.t
 
-		# U-Net Train
-		if os.path.isfile(unet_path):
-			# Load the pretrained Encoder
-			self.unet.load_state_dict(torch.load(unet_path))
-			print('%s is Successfully Loaded from %s'%(self.model_type,unet_path))
-		else:
-			# Train for Encoder
-			lr = self.lr
-			best_unet_score = 0.
-			
-			for epoch in range(self.num_epochs):
+        self.lr = config.lr
+        self.beta1 = config.beta1
+        self.beta2 = config.beta2
+        self.num_epochs = config.num_epochs
 
-				self.unet.train(True)
-				epoch_loss = 0
-				
-				acc = 0.	# Accuracy
-				SE = 0.		# Sensitivity (Recall)
-				SP = 0.		# Specificity
-				PC = 0. 	# Precision
-				F1 = 0.		# F1 Score
-				JS = 0.		# Jaccard Similarity
-				DC = 0.		# Dice Coefficient
-				length = 0
+        self.model_path = config.model_path
+        self.result_path = config.result_path
 
-				for i, (images, GT) in enumerate(self.train_loader):
-					# GT : Ground Truth
+        self.device = torch.device(
+            f'cuda:{config.cuda_idx}' if torch.cuda.is_available() else 'cpu'
+        )
 
-					images = images.to(self.device)
-					GT = GT.to(self.device)
+        self.bce_loss = nn.BCEWithLogitsLoss()
+        self.dice_loss = DiceLoss()
 
-					# SR : Segmentation Result
-					SR = self.unet(images)
-					SR_probs = F.sigmoid(SR)
-					SR_flat = SR_probs.view(SR_probs.size(0),-1)
+        self.model = None
+        self.optimizer = None
+        self.scheduler = None
+        self.build_model()
 
-					GT_flat = GT.view(GT.size(0),-1)
-					loss = self.criterion(SR_flat,GT_flat)
-					epoch_loss += loss.item()
+    # ------------------------------------------------------------------
+    # Model
+    # ------------------------------------------------------------------
+    def build_model(self):
+        builders = {
+            'U_Net':      lambda: U_Net(img_ch=self.img_ch, output_ch=self.output_ch),
+            'R2U_Net':    lambda: R2U_Net(img_ch=self.img_ch, output_ch=self.output_ch, t=self.t),
+            'AttU_Net':   lambda: AttU_Net(img_ch=self.img_ch, output_ch=self.output_ch),
+            'R2AttU_Net': lambda: R2AttU_Net(img_ch=self.img_ch, output_ch=self.output_ch, t=self.t),
+        }
+        self.model = builders[self.model_type]()
+        self.model.to(self.device)
+        self.optimizer = optim.Adam(
+            self.model.parameters(), self.lr, (self.beta1, self.beta2)
+        )
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=self.num_epochs, eta_min=1e-6
+        )
 
-					# Backprop + optimize
-					self.reset_grad()
-					loss.backward()
-					self.optimizer.step()
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+    def train(self):
+        best_path = os.path.join(self.model_path, 'best_model.pth')
+        best_dsc = 0.0
+        best_epoch = 0
 
-					acc += get_accuracy(SR,GT)
-					SE += get_sensitivity(SR,GT)
-					SP += get_specificity(SR,GT)
-					PC += get_precision(SR,GT)
-					F1 += get_F1(SR,GT)
-					JS += get_JS(SR,GT)
-					DC += get_DC(SR,GT)
-					length += images.size(0)
+        for epoch in range(self.num_epochs):
+            # --- train one epoch ---
+            self.model.train()
+            epoch_loss = 0.0
+            train_dsc = 0.0
+            train_iou = 0.0
+            n_samples = 0
 
-				acc = acc/length
-				SE = SE/length
-				SP = SP/length
-				PC = PC/length
-				F1 = F1/length
-				JS = JS/length
-				DC = DC/length
+            for images, masks in self.train_loader:
+                images = images.to(self.device)
+                masks = masks.to(self.device)
 
-				# Print the log info
-				print('Epoch [%d/%d], Loss: %.4f, \n[Training] Acc: %.4f, SE: %.4f, SP: %.4f, PC: %.4f, F1: %.4f, JS: %.4f, DC: %.4f' % (
-					  epoch+1, self.num_epochs, \
-					  epoch_loss,\
-					  acc,SE,SP,PC,F1,JS,DC))
+                logits = self.model(images)
+                loss = self.bce_loss(logits, masks) + self.dice_loss(logits, masks)
 
-			
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
 
-				# Decay learning rate
-				if (epoch+1) > (self.num_epochs - self.num_epochs_decay):
-					lr -= (self.lr / float(self.num_epochs_decay))
-					for param_group in self.optimizer.param_groups:
-						param_group['lr'] = lr
-					print ('Decay learning rate to lr: {}.'.format(lr))
-				
-				
-				#===================================== Validation ====================================#
-				self.unet.train(False)
-				self.unet.eval()
+                with torch.no_grad():
+                    probs = torch.sigmoid(logits)
+                    bs = images.size(0)
+                    epoch_loss += loss.item() * bs
+                    for i in range(bs):
+                        train_dsc += get_DSC(probs[i], masks[i]).item()
+                        train_iou += get_IoU(probs[i], masks[i]).item()
+                    n_samples += bs
 
-				acc = 0.	# Accuracy
-				SE = 0.		# Sensitivity (Recall)
-				SP = 0.		# Specificity
-				PC = 0. 	# Precision
-				F1 = 0.		# F1 Score
-				JS = 0.		# Jaccard Similarity
-				DC = 0.		# Dice Coefficient
-				length=0
-				for i, (images, GT) in enumerate(self.valid_loader):
+            self.scheduler.step()
+            epoch_loss /= n_samples
+            train_dsc /= n_samples
+            train_iou /= n_samples
 
-					images = images.to(self.device)
-					GT = GT.to(self.device)
-					SR = F.sigmoid(self.unet(images))
-					acc += get_accuracy(SR,GT)
-					SE += get_sensitivity(SR,GT)
-					SP += get_specificity(SR,GT)
-					PC += get_precision(SR,GT)
-					F1 += get_F1(SR,GT)
-					JS += get_JS(SR,GT)
-					DC += get_DC(SR,GT)
-						
-					length += images.size(0)
-					
-				acc = acc/length
-				SE = SE/length
-				SP = SP/length
-				PC = PC/length
-				F1 = F1/length
-				JS = JS/length
-				DC = DC/length
-				unet_score = JS + DC
+            # --- validate ---
+            val_dsc, val_iou = self._validate()
 
-				print('[Validation] Acc: %.4f, SE: %.4f, SP: %.4f, PC: %.4f, F1: %.4f, JS: %.4f, DC: %.4f'%(acc,SE,SP,PC,F1,JS,DC))
-				
-				'''
-				torchvision.utils.save_image(images.data.cpu(),
-											os.path.join(self.result_path,
-														'%s_valid_%d_image.png'%(self.model_type,epoch+1)))
-				torchvision.utils.save_image(SR.data.cpu(),
-											os.path.join(self.result_path,
-														'%s_valid_%d_SR.png'%(self.model_type,epoch+1)))
-				torchvision.utils.save_image(GT.data.cpu(),
-											os.path.join(self.result_path,
-														'%s_valid_%d_GT.png'%(self.model_type,epoch+1)))
-				'''
+            lr_now = self.optimizer.param_groups[0]['lr']
+            print(
+                f'Epoch [{epoch + 1:3d}/{self.num_epochs}] '
+                f'lr={lr_now:.2e}  Loss={epoch_loss:.4f}  |  '
+                f'Train DSC={train_dsc:.4f} IoU={train_iou:.4f}  |  '
+                f'Val DSC={val_dsc:.4f} IoU={val_iou:.4f}'
+            )
 
+            if val_dsc > best_dsc:
+                best_dsc = val_dsc
+                best_epoch = epoch + 1
+                torch.save(self.model.state_dict(), best_path)
+                print(f'  >> New best (Val DSC={best_dsc:.4f})')
 
-				# Save Best U-Net model
-				if unet_score > best_unet_score:
-					best_unet_score = unet_score
-					best_epoch = epoch
-					best_unet = self.unet.state_dict()
-					print('Best %s model score : %.4f'%(self.model_type,best_unet_score))
-					torch.save(best_unet,unet_path)
-					
-			#===================================== Test ====================================#
-			del self.unet
-			del best_unet
-			self.build_model()
-			self.unet.load_state_dict(torch.load(unet_path))
-			
-			self.unet.train(False)
-			self.unet.eval()
+        print(f'\nTraining complete. Best epoch={best_epoch}, '
+              f'Best Val DSC={best_dsc:.4f}')
+        print('Running test on best model ...\n')
+        self.test()
 
-			acc = 0.	# Accuracy
-			SE = 0.		# Sensitivity (Recall)
-			SP = 0.		# Specificity
-			PC = 0. 	# Precision
-			F1 = 0.		# F1 Score
-			JS = 0.		# Jaccard Similarity
-			DC = 0.		# Dice Coefficient
-			length=0
-			for i, (images, GT) in enumerate(self.valid_loader):
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _validate(self):
+        self.model.eval()
+        total_dsc, total_iou, n = 0.0, 0.0, 0
+        for images, masks in self.val_loader:
+            images = images.to(self.device)
+            masks = masks.to(self.device)
+            probs = torch.sigmoid(self.model(images))
+            bs = images.size(0)
+            for i in range(bs):
+                total_dsc += get_DSC(probs[i], masks[i]).item()
+                total_iou += get_IoU(probs[i], masks[i]).item()
+            n += bs
+        return total_dsc / n, total_iou / n
 
-				images = images.to(self.device)
-				GT = GT.to(self.device)
-				SR = F.sigmoid(self.unet(images))
-				acc += get_accuracy(SR,GT)
-				SE += get_sensitivity(SR,GT)
-				SP += get_specificity(SR,GT)
-				PC += get_precision(SR,GT)
-				F1 += get_F1(SR,GT)
-				JS += get_JS(SR,GT)
-				DC += get_DC(SR,GT)
-						
-				length += images.size(0)
-					
-			acc = acc/length
-			SE = SE/length
-			SP = SP/length
-			PC = PC/length
-			F1 = F1/length
-			JS = JS/length
-			DC = DC/length
-			unet_score = JS + DC
+    # ------------------------------------------------------------------
+    # Testing  (DSC, IoU, HD95, FPS, FLOPs, VRAM Peak)
+    # ------------------------------------------------------------------
+    def test(self):
+        best_path = os.path.join(self.model_path, 'best_model.pth')
+        if not os.path.isfile(best_path):
+            print(f'ERROR: {best_path} not found. Train first.')
+            return
+        self.model.load_state_dict(
+            torch.load(best_path, map_location=self.device)
+        )
+        self.model.eval()
 
+        # ---- FLOPs (computed once) ----
+        flops_g = self._compute_flops()
 
-			f = open(os.path.join(self.result_path,'result.csv'), 'a', encoding='utf-8', newline='')
-			wr = csv.writer(f)
-			wr.writerow([self.model_type,acc,SE,SP,PC,F1,JS,DC,self.lr,best_epoch,self.num_epochs,self.num_epochs_decay,self.augmentation_prob])
-			f.close()
-			
+        # ---- GPU warm-up & VRAM baseline ----
+        with torch.no_grad():
+            dummy = torch.randn(
+                1, self.img_ch, self.image_size, self.image_size,
+                device=self.device,
+            )
+            for _ in range(20):
+                self.model(dummy)
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats(self.device)
 
-			
+        # ---- Inference loop ----
+        results = []
+        total_time = 0.0
+
+        with torch.no_grad():
+            for images, masks in self.test_loader:
+                images = images.to(self.device)
+                masks = masks.to(self.device)
+
+                if self.device.type == 'cuda':
+                    torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                logits = self.model(images)
+                if self.device.type == 'cuda':
+                    torch.cuda.synchronize()
+                t1 = time.perf_counter()
+                total_time += t1 - t0
+
+                probs = torch.sigmoid(logits)
+                for i in range(images.size(0)):
+                    dsc_val = get_DSC(probs[i], masks[i]).item()
+                    iou_val = get_IoU(probs[i], masks[i]).item()
+                    hd95_val = get_HD95(probs[i], masks[i])
+                    results.append({
+                        'DSC': dsc_val, 'IoU': iou_val, 'HD95': hd95_val,
+                    })
+
+        # ---- Aggregate ----
+        n = len(results)
+        fps = n / total_time if total_time > 0 else 0.0
+        vram_peak_mb = 0.0
+        if self.device.type == 'cuda':
+            vram_peak_mb = torch.cuda.max_memory_allocated(self.device) / (1024 ** 2)
+
+        avg_dsc = np.mean([r['DSC'] for r in results])
+        avg_iou = np.mean([r['IoU'] for r in results])
+        hd95_finite = [r['HD95'] for r in results if np.isfinite(r['HD95'])]
+        avg_hd95 = np.mean(hd95_finite) if hd95_finite else float('nan')
+
+        # ---- Print ----
+        sep = '=' * 55
+        print(sep)
+        print(f'  Test Results: {self.model_type}  on  {self.config.dataset}')
+        print(sep)
+        print(f'  DSC        : {avg_dsc:.4f}')
+        print(f'  IoU        : {avg_iou:.4f}')
+        print(f'  HD95       : {avg_hd95:.4f}')
+        print(f'  FPS        : {fps:.2f}')
+        print(f'  FLOPs      : {flops_g:.4f} G')
+        print(f'  VRAM Peak  : {vram_peak_mb:.2f} MB')
+        print(sep)
+
+        # ---- Save per-sample CSV ----
+        per_csv = os.path.join(self.result_path, 'per_sample.csv')
+        with open(per_csv, 'w', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=['DSC', 'IoU', 'HD95'])
+            w.writeheader()
+            w.writerows(results)
+
+        # ---- Save summary CSV ----
+        summary_csv = os.path.join(self.result_path, 'summary.csv')
+        with open(summary_csv, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow([
+                'Model', 'Dataset', 'DSC', 'IoU', 'HD95',
+                'FPS', 'FLOPs_G', 'VRAM_Peak_MB',
+            ])
+            w.writerow([
+                self.model_type, self.config.dataset,
+                f'{avg_dsc:.4f}', f'{avg_iou:.4f}', f'{avg_hd95:.4f}',
+                f'{fps:.2f}', f'{flops_g:.4f}', f'{vram_peak_mb:.2f}',
+            ])
+
+        print(f'  Results saved to {self.result_path}/\n')
+
+    # ------------------------------------------------------------------
+    # FLOPs (via thop)
+    # ------------------------------------------------------------------
+    def _compute_flops(self):
+        try:
+            from thop import profile
+            dummy = torch.randn(
+                1, self.img_ch, self.image_size, self.image_size,
+                device=self.device,
+            )
+            flops, _ = profile(self.model, inputs=(dummy,), verbose=False)
+            return flops / 1e9
+        except ImportError:
+            print('WARNING: thop not installed – FLOPs skipped.  '
+                  'Install with:  pip install thop')
+            return 0.0

@@ -1,87 +1,42 @@
 import torch
-
-# SR : Segmentation Result
-# GT : Ground Truth
-
-def get_accuracy(SR,GT,threshold=0.5):
-    SR = SR > threshold
-    GT = GT == torch.max(GT)
-    corr = torch.sum(SR==GT)
-    tensor_size = SR.size(0)*SR.size(1)*SR.size(2)*SR.size(3)
-    acc = float(corr)/float(tensor_size)
-
-    return acc
-
-def get_sensitivity(SR,GT,threshold=0.5):
-    # Sensitivity == Recall
-    SR = SR > threshold
-    GT = GT == torch.max(GT)
-
-    # TP : True Positive
-    # FN : False Negative
-    TP = ((SR==1)+(GT==1))==2
-    FN = ((SR==0)+(GT==1))==2
-
-    SE = float(torch.sum(TP))/(float(torch.sum(TP+FN)) + 1e-6)     
-    
-    return SE
-
-def get_specificity(SR,GT,threshold=0.5):
-    SR = SR > threshold
-    GT = GT == torch.max(GT)
-
-    # TN : True Negative
-    # FP : False Positive
-    TN = ((SR==0)+(GT==0))==2
-    FP = ((SR==1)+(GT==0))==2
-
-    SP = float(torch.sum(TN))/(float(torch.sum(TN+FP)) + 1e-6)
-    
-    return SP
-
-def get_precision(SR,GT,threshold=0.5):
-    SR = SR > threshold
-    GT = GT == torch.max(GT)
-
-    # TP : True Positive
-    # FP : False Positive
-    TP = ((SR==1)+(GT==1))==2
-    FP = ((SR==1)+(GT==0))==2
-
-    PC = float(torch.sum(TP))/(float(torch.sum(TP+FP)) + 1e-6)
-
-    return PC
-
-def get_F1(SR,GT,threshold=0.5):
-    # Sensitivity == Recall
-    SE = get_sensitivity(SR,GT,threshold=threshold)
-    PC = get_precision(SR,GT,threshold=threshold)
-
-    F1 = 2*SE*PC/(SE+PC + 1e-6)
-
-    return F1
-
-def get_JS(SR,GT,threshold=0.5):
-    # JS : Jaccard similarity
-    SR = SR > threshold
-    GT = GT == torch.max(GT)
-    
-    Inter = torch.sum((SR+GT)==2)
-    Union = torch.sum((SR+GT)>=1)
-    
-    JS = float(Inter)/(float(Union) + 1e-6)
-    
-    return JS
-
-def get_DC(SR,GT,threshold=0.5):
-    # DC : Dice Coefficient
-    SR = SR > threshold
-    GT = GT == torch.max(GT)
-
-    Inter = torch.sum((SR+GT)==2)
-    DC = float(2*Inter)/(float(torch.sum(SR)+torch.sum(GT)) + 1e-6)
-
-    return DC
+import numpy as np
+from medpy.metric.binary import hd95 as medpy_hd95
 
 
+def get_DSC(pred, gt, threshold=0.5):
+    """Dice Similarity Coefficient (per-sample, on GPU tensors)."""
+    p = (pred > threshold).float()
+    g = (gt > 0.5).float()
+    inter = (p * g).sum()
+    return (2.0 * inter + 1e-8) / (p.sum() + g.sum() + 1e-8)
 
+
+def get_IoU(pred, gt, threshold=0.5):
+    """Intersection over Union / Jaccard Index (per-sample)."""
+    p = (pred > threshold).float()
+    g = (gt > 0.5).float()
+    inter = (p * g).sum()
+    union = p.sum() + g.sum() - inter
+    return (inter + 1e-8) / (union + 1e-8)
+
+
+def get_HD95(pred, gt, threshold=0.5):
+    """95th-percentile Hausdorff Distance (per-sample, on CPU/numpy).
+
+    When one side is empty but the other is not, returns the image diagonal
+    as a finite upper-bound so that downstream averaging stays meaningful.
+    """
+    pred_np = (pred > threshold).squeeze().cpu().numpy().astype(np.bool_)
+    gt_np = (gt > 0.5).squeeze().cpu().numpy().astype(np.bool_)
+
+    if pred_np.sum() == 0 and gt_np.sum() == 0:
+        return 0.0
+    if pred_np.sum() == 0 or gt_np.sum() == 0:
+        h, w = pred_np.shape[-2:]
+        return float(np.sqrt(h ** 2 + w ** 2))
+
+    try:
+        return float(medpy_hd95(pred_np, gt_np))
+    except Exception:
+        h, w = pred_np.shape[-2:]
+        return float(np.sqrt(h ** 2 + w ** 2))
