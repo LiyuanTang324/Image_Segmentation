@@ -84,10 +84,10 @@ if __name__ == '__main__':
                         help='train (includes test at end) or test only')
 
     parser.add_argument('--image_root', type=str,
-                        default='/root/autodl-tmp/XpertUS/data/segmentation',
+                        default='../../data/segmentation',
                         help='Root dir containing <dataset>/imgs/ and masks/')
     parser.add_argument('--split_root', type=str,
-                        default='/root/autodl-tmp/control_experiment/data/segmentation',
+                        default='../../data/segmentation',
                         help='Root dir containing <dataset>/train.txt etc.')
     parser.add_argument('--output_root', type=str, default='./output',
                         help='Root dir for checkpoints and results')
